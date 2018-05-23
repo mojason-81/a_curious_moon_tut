@@ -87,7 +87,7 @@ left join requests
 left join spass_types
     on spass_types.description = import.master_plan.spass_type;
 
-drop view if exists enceladus_events;
+drop materialized view if exists enceladus_events;
 create materialized view enceladus_events as
 select
     events.id,
@@ -107,3 +107,94 @@ order by time_stamp;
 
 create index idx_event_search
 on enceladus_events using GIN(search);
+
+-- cleat up import.inms by removing headers and empty rows
+delete from import.inms
+where sclk IS NULL or sclk = 'sclk';
+
+drop materialized view if exists flyby_altitudes;
+create materialized view flyby_altitudes as
+select
+    (sclk::timestamp) as time_stamp,
+    date_part('year', (sclk::timestamp)) as year,
+    date_part('week', (sclk::timestamp)) as week,
+    alt_t::numeric(10,3) as altitude
+from import.inms
+where target = 'ENCELADUS'
+    and alt_t is not null;
+
+drop function if exists low_time(
+    numeric,
+    double precision,
+    double precision
+);
+create function low_time(
+    alt numeric,
+    yr double precision,
+    wk double precision,
+    out timestamp without time zone
+) as $$
+select
+    min(time_stamp) + (( max(time_stamp) - min(time_stamp)) /2) as nadir
+    from flyby_altitudes
+    where flyby_altitudes.altitude = alt
+    and flyby_altitudes.year = yr
+    and flyby_altitudes.week = wk
+$$ language sql;
+
+-- convenience for redoing
+drop table if exists flybys;
+with lows_by_week as (
+    select year, week,
+    min(altitude) as altitude
+    from flyby_altitudes
+    group by year, week
+), nadirs as (
+    select low_time(altitude, year, week) as time_stamp,
+        altitude
+    from lows_by_week
+)
+
+-- exec the CTE
+select nadirs.*,
+    -- set initial vals to null
+    null::varchar as name,
+    null::timestamptz as start_time,
+    null::timestamptz as end_time
+-- push to a new table
+into flybys
+from nadirs;
+-- add pk
+alter table flybys
+add column id serial primary key;
+-- using the key, create
+-- the name using the new id
+-- || cancatenates strings
+-- and also coerces to string
+update flybys
+set name='E-' || id-1;
+
+drop schema if exists cda cascade;
+create schema cda;
+select
+    icda.event_id::integer as id,
+    icda.impact_event_time::timestamp as time_stamp,
+    icda.impact_event_time::date as impact_date,
+    case icda.counter_number
+        when '** ' then null
+        else counter_number::integer
+    end as counter,
+    icda.counter_number::integer,
+    icda.spacecraft_sun_distance::numeric(6,4) as sun_distance_au,
+    icda.spacecraft_saturn_distance::numeric(8,2) as saturn_distance_rads,
+    icda.spacecraft_x_velocity::numeric(6,2) as x_velocity,
+    icda.spacecraft_y_velocity::numeric(6,2) as y_velocity,
+    icda.spacecraft_z_velocity::numeric(6,2) as z_velocity,
+    icda.particle_charge::numeric(4,1),
+    icda.particle_mass::numeric(4,1)
+into cda.impacts
+from import.cda as icda
+order by icda.impact_event_time::timestamptz;
+
+alter table cda.impacts
+add id serial primary key;
